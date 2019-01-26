@@ -13,6 +13,7 @@
 #ifdef ENABLE_WALLET
 #include "db.h"
 #include "wallet.h"
+#include "base58.h"
 #endif
 #include <stdint.h>
 
@@ -916,4 +917,178 @@ Value getauxblock(const Array& params, bool fHelp)
         }
     }
 }
+
+static CCriticalSection cs_auxblockCache;
+static map<uint256, CBlock*> mapNewBlock;
+static vector<CBlockTemplate*> vNewBlockTemplate;
+
+
+static 
+void AuxMiningCheck()
+{
+    if (vNodes.empty())
+        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Dogecoin is not connected!");
+
+    if (IsInitialBlockDownload())
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "Dogecoin is downloading blocks...");
+
+    // We use height plus one because we're testing the next block
+    if ((chainActive.Tip()->nHeight+1) < GetAuxPowStartBlock()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "getauxblock method is not available until switch-over block.");
+    }
+}
+
+
+Value AuxMiningCreateBlock(const CScript& scriptPubKey)
+{
+    AuxMiningCheck();
+    LOCK(cs_auxblockCache);
+
+    static unsigned int nTransactionsUpdatedLast;
+    static CBlockIndex* pindexPrev;
+    static uint64_t nStart;
+    static CBlock* pblock;
+    static CBlockTemplate* pblocktemplate; 
+
+    // Update block
+    // Dogecoin: Never mine witness tx
+    // const bool fMineWitnessTx = false;
+    // {
+      // LOCK(cs_main);
+      if (pindexPrev != chainActive.Tip() ||
+            (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && 
+                GetTime() - nStart > 60)) 
+      {
+        
+        if (pindexPrev != chainActive.Tip())
+        {
+            mapNewBlock.clear();
+            BOOST_FOREACH(CBlockTemplate* pblocktemplate, vNewBlockTemplate)
+                delete pblocktemplate;
+            vNewBlockTemplate.clear();
+        }
+
+        nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
+        pindexPrev = chainActive.Tip();
+        nStart = GetTime();
+
+        pblocktemplate = CreateNewBlock(scriptPubKey);
+        if (!pblocktemplate)
+        throw JSONRPCError(RPC_OUT_OF_MEMORY, "out of memory");
+
+        pblock = &pblocktemplate->block;
+        // Update nTime
+        pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+        pblock->nNonce = 0;
+        // Update nExtraNonce
+        static unsigned int nExtraNonce = 0;
+        IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+
+        // Sets the version
+        pblock->SetAuxPow(new CAuxPow());
+
+        // Save
+        mapNewBlock[pblock->GetHash()] = pblock;
+        vNewBlockTemplate.push_back(pblocktemplate);       
+      }
+    // }
+
+    uint256 target = CBigNum().SetCompact(pblock->nBits).getuint256();
+
+    Object result;
+    result.push_back(Pair("hash", pblock->GetHash().GetHex()));
+    result.push_back(Pair("chainid", pblock->GetChainID()));
+    result.push_back(Pair("previousblockhash", pblock->hashPrevBlock.GetHex()));
+    result.push_back(Pair("coinbasevalue", (int64_t)pblock->vtx[0].vout[0].nValue));
+    result.push_back(Pair("bits", strprintf("%08x", pblock->nBits)));
+    result.push_back(Pair("height", static_cast<int64_t> (pindexPrev->nHeight + 1)));
+    result.push_back(Pair("_target", HexStr(BEGIN(target), END(target))));
+    return result;
+}
+
+
+static
+Value AuxMiningSubmitBlock(const std::string& hashHex, const std::string& auxpowHex)
+{
+    AuxMiningCheck();
+
+    LOCK(cs_auxblockCache);
+
+    uint256 hash;
+    hash.SetHex(hashHex);
+
+    const std::map<uint256, CBlock*>::iterator mit = mapNewBlock.find(hash);
+    if (mit == mapNewBlock.end())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "block not found");
+    CBlock& block = *mit->second;
+
+    const std::vector<unsigned char> vchAuxPow = ParseHex(auxpowHex);
+    CDataStream ss(vchAuxPow, SER_GETHASH, PROTOCOL_VERSION);
+    CAuxPow* pow = new CAuxPow();
+    ss >> *pow;
+    CBlock* pblock = mapNewBlock[hash];
+    pblock->SetAuxPow(pow);
+
+    CValidationState state;
+    bool fAccepted = ProcessBlock(state, NULL, &block);
+    if (!fAccepted)
+      return "rejected";
+    return Value::null;
+}
+
+
+Value createauxblock(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw std::runtime_error(
+            "createauxblock <address>\n"
+            "\ncreate a new block and return information required to merge-mine it.\n"
+            "\nArguments:\n"
+            "1. address      (string, required) specify coinbase transaction payout address\n"
+            "\nResult:\n"
+            "{\n"
+            "  \"hash\"               (string) hash of the created block\n"
+            "  \"chainid\"            (numeric) chain ID for this block\n"
+            "  \"previousblockhash\"  (string) hash of the previous block\n"
+            "  \"coinbasevalue\"      (numeric) value of the block's coinbase\n"
+            "  \"bits\"               (string) compressed target of the block\n"
+            "  \"height\"             (numeric) height of the block\n"
+            "  \"_target\"            (string) target in reversed byte order, deprecated\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("createauxblock", "\"address\"")
+            + HelpExampleRpc("createauxblock", "\"address\"")
+            );
+
+    // Check coinbase payout address
+    CBitcoinAddress coinbaseAddress(params[0].get_str());
+    if (!coinbaseAddress.IsValid())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid coinbase payout address");
+    const CScript scriptPubKey = GetScriptForDestination(coinbaseAddress.Get());
+
+    return AuxMiningCreateBlock(scriptPubKey);
+}
+
+
+Value submitauxblock(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw std::runtime_error(
+            "submitauxblock (hash auxpow)\n"
+            "\nsubmit a solved auxpow for a previously block created by 'createauxblock'.\n"
+            "\nArguments:\n"
+            "1. hash      (string, required) hash of the block to submit\n"
+            "2. auxpow    (string, required) serialised auxpow found\n"
+            "\nResult:\n"
+            "xxxxx        (boolean) whether the submitted block was correct\n"
+            "\nExamples:\n"
+            + HelpExampleCli("submitauxblock", "\"hash\" \"serialised auxpow\"")
+            + HelpExampleRpc("submitauxblock", "")
+            );
+
+    return AuxMiningSubmitBlock(params[0].get_str(), 
+                           params[1].get_str());
+}
+
+
 #endif
