@@ -951,10 +951,8 @@ Value AuxMiningCreateBlock(const CScript& scriptPubKey)
     static CBlockTemplate* pblocktemplate; 
 
     // Update block
-    // Dogecoin: Never mine witness tx
-    // const bool fMineWitnessTx = false;
-    // {
-      // LOCK(cs_main);
+    {
+      LOCK(cs_main);
       if (pindexPrev != chainActive.Tip() ||
             (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && 
                 GetTime() - nStart > 60)) 
@@ -966,6 +964,7 @@ Value AuxMiningCreateBlock(const CScript& scriptPubKey)
             BOOST_FOREACH(CBlockTemplate* pblocktemplate, vNewBlockTemplate)
                 delete pblocktemplate;
             vNewBlockTemplate.clear();
+            pblock = NULL;
         }
 
         nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
@@ -991,7 +990,7 @@ Value AuxMiningCreateBlock(const CScript& scriptPubKey)
         mapNewBlock[pblock->GetHash()] = pblock;
         vNewBlockTemplate.push_back(pblocktemplate);       
       }
-    // }
+    }
 
     uint256 target = CBigNum().SetCompact(pblock->nBits).getuint256();
 
@@ -1017,20 +1016,24 @@ Value AuxMiningSubmitBlock(const std::string& hashHex, const std::string& auxpow
     uint256 hash;
     hash.SetHex(hashHex);
 
-    const std::map<uint256, CBlock*>::iterator mit = mapNewBlock.find(hash);
-    if (mit == mapNewBlock.end())
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "block not found");
-    CBlock& block = *mit->second;
+    if (!mapNewBlock.count(hash)) {
+        string einfo = "block " + hash.GetHex() +" not found , the mapNewBlock hash-key list : ";
+        for(std::map<uint256, CBlock*>::iterator iter = mapNewBlock.begin(); iter != mapNewBlock.end(); iter ++)
+            einfo += (iter->first).GetHex() + " ; ";
+        return JSONRPCError(RPC_INVALID_PARAMETER, einfo.c_str());
+    }
 
     const std::vector<unsigned char> vchAuxPow = ParseHex(auxpowHex);
     CDataStream ss(vchAuxPow, SER_GETHASH, PROTOCOL_VERSION);
     CAuxPow* pow = new CAuxPow();
     ss >> *pow;
+
+
     CBlock* pblock = mapNewBlock[hash];
     pblock->SetAuxPow(pow);
 
     CValidationState state;
-    bool fAccepted = ProcessBlock(state, NULL, &block);
+    bool fAccepted = ProcessBlock(state, NULL, pblock);
     if (!fAccepted)
       return "rejected";
     return Value::null;
